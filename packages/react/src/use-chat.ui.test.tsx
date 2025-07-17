@@ -6,7 +6,7 @@ import {
   TestResponseController,
 } from '@ai-sdk/provider-utils/test';
 import '@testing-library/jest-dom/vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {
   DefaultChatTransport,
@@ -2436,6 +2436,142 @@ describe('id changes', () => {
     await userEvent.click(screen.getByTestId('do-change-id'));
 
     expect(screen.queryByTestId('message-0')).not.toBeInTheDocument();
+  });
+
+  it('should abort active stream when id changes from undefined to defined', async () => {
+    const controller = new TestResponseController();
+    
+    server.urls['/api/chat'].response = {
+      type: 'controlled-stream',
+      controller,
+    };
+
+    // Send message while id is undefined
+    await userEvent.click(screen.getByTestId('do-send'));
+    
+    // Start streaming
+    controller.write(formatChunk({ type: 'text-start', id: '0' }));
+    controller.write(
+      formatChunk({ type: 'text-delta', id: '0', delta: 'Hello' }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('status')).toHaveTextContent('streaming');
+    });
+
+    // Change ID while streaming
+    await userEvent.click(screen.getByTestId('do-change-id'));
+
+    // Verify that the stream was aborted and status is ready
+    await waitFor(() => {
+      expect(screen.getByTestId('status')).toHaveTextContent('ready');
+    });
+
+    // Try to write more data - should fail because stream was aborted
+    await expect(
+      controller.write(
+        formatChunk({ type: 'text-delta', id: '0', delta: ', world!' }),
+      ),
+    ).rejects.toThrow();
+  });
+});
+
+describe('streaming with undefined id then defined', () => {
+  const server = createTestServer({
+    '/api/chat': {},
+  });
+  
+  it('should handle streaming when id changes from undefined to defined', async () => {
+    const TestComponent = () => {
+      const [id, setId] = React.useState<string | undefined>(undefined);
+      
+      const {
+        messages,
+        sendMessage,
+        status,
+        id: idKey,
+      } = useChat({
+        id,
+        generateId: mockId(),
+      });
+
+      return (
+        <div>
+          <div data-testid="id">{idKey || 'undefined'}</div>
+          <div data-testid="status">{status}</div>
+          <div data-testid="messages-count">{messages.length}</div>
+          {messages.map((m, idx) => (
+            <div data-testid={`message-${idx}`} key={m.id}>
+              {m.role === 'user' ? 'User: ' : 'AI: '}
+              {m.parts
+                .map(part => (part.type === 'text' ? part.text : ''))
+                .join('')}
+            </div>
+          ))}
+          <button
+            data-testid="set-id"
+            onClick={() => setId('real-id')}
+          />
+          <button
+            data-testid="send"
+            onClick={() => {
+              sendMessage({ parts: [{ text: 'Hello', type: 'text' }] });
+            }}
+          />
+        </div>
+      );
+    };
+
+    const controller = new TestResponseController();
+    server.urls['/api/chat'].response = {
+      type: 'controlled-stream',
+      controller,
+    };
+
+    render(<TestComponent />);
+
+    // Initial state with undefined ID
+    expect(screen.getByTestId('messages-count')).toHaveTextContent('0');
+    
+    // Change ID to a real value
+    await userEvent.click(screen.getByTestId('set-id'));
+    
+    await waitFor(() => {
+      expect(screen.getByTestId('id')).toHaveTextContent('real-id');
+    });
+
+    // Send a message
+    await userEvent.click(screen.getByTestId('send'));
+
+    // User message should appear
+    await waitFor(() => {
+      expect(screen.getByTestId('messages-count')).toHaveTextContent('1');
+      expect(screen.getByTestId('message-0')).toHaveTextContent('User: Hello');
+    });
+
+    // Start streaming response
+    controller.write(formatChunk({ type: 'text-start', id: '0' }));
+    controller.write(
+      formatChunk({ type: 'text-delta', id: '0', delta: 'Hi' }),
+    );
+
+    // Check that streaming updates appear
+    await waitFor(() => {
+      expect(screen.getByTestId('messages-count')).toHaveTextContent('2');
+      expect(screen.getByTestId('message-1')).toHaveTextContent('AI: Hi');
+    });
+
+    // Continue streaming
+    controller.write(
+      formatChunk({ type: 'text-delta', id: '0', delta: ' there!' }),
+    );
+    controller.write(formatChunk({ type: 'text-end', id: '0' }));
+    controller.close();
+
+    // Verify complete message
+    await waitFor(() => {
+      expect(screen.getByTestId('message-1')).toHaveTextContent('AI: Hi there!');
+    });
   });
 });
 
